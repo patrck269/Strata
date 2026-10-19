@@ -3076,6 +3076,181 @@ uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
 #endif
 }
 
+bool FileExpertSource::fill_complement_sequential(uint8_t* host, const std::vector<uint64_t>& offsets, uint64_t bytes) {
+#if !defined(_WIN32)
+    (void) host;
+    (void) offsets;
+    (void) bytes;
+    return false;   // the Linux paced pin is unchanged; this startup fill is the Windows complement copy
+#else
+    // The mapped copy faults one expert at a time. read_direct is the wrong reader for this pass: it is off while
+    // direct_ is empty (the GGUF start), it merges only to 32 MiB, and it bounces a whole batch through one scratch.
+    // One sequential pass of large unbuffered reads, then each slice is stored at the offset the plan already chose.
+    // The arena is hottest-first, not a file image. A short or failed read returns false and the mapped copy runs.
+    if (host == nullptr || bytes == 0 || paths_.empty() || n_layers_ <= 0 || n_expert_ <= 0) return false;
+    constexpr uint64_t kSector = 4096;
+    constexpr uint64_t kGap = 8ull << 20;
+    constexpr uint64_t kMerge = 256ull << 20;
+    struct Win { int file; uint64_t a0, size, skip, n; uint8_t* dst; };
+    struct Req { int file; uint64_t a0, size; std::vector<size_t> wins; };
+    struct Held {
+        std::vector<HANDLE> owned;
+        uint8_t* buf = nullptr;
+        ~Held() {
+            for (HANDLE h : owned)
+                if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+            if (buf != nullptr) VirtualFree(buf, 0, MEM_RELEASE);
+        }
+    } held;
+    auto miss = [](const char* why) {
+        std::fprintf(stderr, "FileExpertSource: sequential unbuffered complement fill missed (%s); copying through the mapping\n",
+                     why);
+        std::fflush(stderr);
+        return false;
+    };
+    std::vector<uint64_t> file_bytes;
+    if (!maps_.empty()) {
+        file_bytes.reserve(maps_.size());
+        for (const Map& m : maps_) file_bytes.push_back(m.bytes);
+    } else {
+        file_bytes.push_back(mapped_bytes_);
+    }
+    // Own handles, not direct_. Those are overlapped, and a synchronous ReadFile on them is refused.
+    // Closing these does not change the file tier.
+    if (paths_.size() != file_bytes.size()) return miss("paths");
+    std::vector<HANDLE> use;
+    use.reserve(paths_.size());
+    for (const std::string& path : paths_) {
+        const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+        std::vector<wchar_t> w((size_t) (wide > 0 ? wide : 1), L'\0');
+        if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, w.data(), wide);
+        const HANDLE h = CreateFileW(w.data(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                     nullptr, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return miss("open");
+        held.owned.push_back(h);
+        use.push_back(h);
+    }
+    std::vector<Win> wins;
+    wins.reserve((size_t) n_layers_ * 4);
+    uint64_t tail_bytes = 0;
+    auto place = [&](int file, uint64_t off, uint64_t n, uint8_t* dst) -> bool {
+        if (n == 0) return true;
+        if (file < 0 || (size_t) file >= file_bytes.size()) return false;
+        const uint64_t fsz = file_bytes[(size_t) file];
+        if (off > fsz || n > fsz - off) return false;
+        const uint64_t sector_end = fsz / kSector * kSector;
+        if (off < sector_end) {
+            const uint64_t take = std::min(n, sector_end - off);
+            const uint64_t a0 = off / kSector * kSector;
+            const uint64_t end = off + take;
+            const uint64_t a1 = (end + kSector - 1) / kSector * kSector;
+            if (a0 >= sector_end || a1 > sector_end || a1 < a0) return false;
+            wins.push_back({file, a0, a1 - a0, off - a0, take, dst});
+            dst += take;
+            off += take;
+            n -= take;
+        }
+        if (n == 0) return true;
+        // The last partial sector cannot be read unbuffered. The mapping still holds those bytes.
+        if (unmapped_ || (!maps_.empty() && maps_[(size_t) file].closed)) return false;
+        const uint8_t* base = maps_.empty() ? base_ : maps_[(size_t) file].base;
+        if (base == nullptr) return false;
+        std::memcpy(dst, base + (size_t) off, (size_t) n);
+        tail_bytes += n;
+        return true;
+    };
+    uint64_t expect = 0;
+    for (int64_t layer = 0; layer < n_layers_; ++layer) {
+        const uint64_t blob_bytes = layer_blob_bytes_[(size_t) layer];
+        for (int64_t expert = 0; expert < n_expert_; ++expert) {
+            const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+            const uint64_t offset = offsets[index];
+            if (offset == kNoComplement) continue;
+            if (offset > bytes || blob_bytes > bytes - offset) return miss("bounds");
+            uint8_t* dst = host + (size_t) offset;
+            expect += blob_bytes;
+            if (role_ptr_.empty()) {
+                const uint64_t file_off = layer_offsets_[(size_t) layer] + (uint64_t) expert * blob_bytes;
+                if (!place(0, file_off, blob_bytes, dst)) return miss("bounds");
+                continue;
+            }
+            uint64_t at = 0;
+            for (int r = 0; r < 3; ++r) {
+                const size_t i = (size_t) (3 * layer + r);
+                const uint64_t per = role_bytes_[i];
+                const int file = role_file_[i];
+                if (file < 0 || (size_t) file >= maps_.size()) return miss("bounds");
+                const Map& m = maps_[(size_t) file];
+                const uint64_t file_off = (uint64_t) (role_ptr_[i] - m.base) + (uint64_t) expert * per;
+                if (!place(file, file_off, per, dst + at)) return miss("bounds");
+                at += per;
+            }
+            if (at != blob_bytes) return miss("bounds");
+        }
+    }
+    if (expect != bytes || wins.empty()) return miss(wins.empty() ? "empty" : "bounds");
+    std::vector<size_t> order(wins.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return wins[a].file != wins[b].file ? wins[a].file < wins[b].file : wins[a].a0 < wins[b].a0;
+    });
+    std::vector<Req> reqs;
+    uint64_t buf_cap = kMerge;
+    for (const Win& w : wins)
+        if (w.size > buf_cap) buf_cap = w.size;
+    for (size_t w : order) {
+        const Win& x = wins[w];
+        if (!reqs.empty() && reqs.back().file == x.file) {
+            Req& q = reqs.back();
+            const uint64_t end = q.a0 + q.size, xend = x.a0 + x.size;
+            if (x.a0 <= end + kGap && std::max(end, xend) - q.a0 <= kMerge) {
+                if (xend > end) q.size = xend - q.a0;
+                q.wins.push_back(w);
+                continue;
+            }
+        }
+        reqs.push_back({x.file, x.a0, x.size, {w}});
+    }
+    buf_cap = (buf_cap + (1ull << 20) - 1) & ~((1ull << 20) - 1);
+    if (buf_cap > 0xffffffffull) return miss("scratch");
+    held.buf = (uint8_t*) VirtualAlloc(nullptr, (SIZE_T) buf_cap, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (held.buf == nullptr) return miss("scratch");
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t placed = tail_bytes, disk = 0;
+    uint64_t noted = 0;
+    for (const Req& q : reqs) {
+        if (q.size == 0 || q.size > buf_cap || (q.size % kSector) != 0 || (q.a0 % kSector) != 0) return miss("bounds");
+        LARGE_INTEGER at{};
+        at.QuadPart = (LONGLONG) q.a0;
+        if (!SetFilePointerEx(use[(size_t) q.file], at, nullptr, FILE_BEGIN)) return miss("seek");
+        DWORD got = 0;
+        if (!ReadFile(use[(size_t) q.file], held.buf, (DWORD) q.size, &got, nullptr)) return miss("read");
+        disk += q.size;
+        for (size_t w : q.wins) {
+            const Win& x = wins[w];
+            const uint64_t rel = x.a0 - q.a0;
+            if ((uint64_t) got < rel + x.skip + x.n) return miss("short");
+            std::memcpy(x.dst, held.buf + (size_t) (rel + x.skip), (size_t) x.n);
+            placed += x.n;
+        }
+        if (placed - noted >= (8ull << 30)) {
+            noted = placed;
+            std::fprintf(stderr, "FileExpertSource: sequential unbuffered complement fill %.2f GiB so far, %.0f s\n",
+                         (double) placed / 1073741824.0,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            std::fflush(stderr);
+        }
+    }
+    if (placed != bytes) return miss("short");
+    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::fprintf(stderr,
+                 "FileExpertSource: sequential unbuffered complement fill placed %.2f GiB in %.1f s across %zu reads (%.2f GiB from the files)\n",
+                 (double) placed / 1073741824.0, sec, reqs.size(), (double) disk / 1073741824.0);
+    std::fflush(stderr);
+    return true;
+#endif
+}
+
 bool FileExpertSource::pin_cache_complement(
     const ExpertCache& cache, std::string& err, bool pin,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
@@ -3556,6 +3731,19 @@ bool FileExpertSource::pin_cache_complement(
         if (fail_msg.empty()) fail_msg = m;
         failed.store(true);
     };
+    const bool seq = host != nullptr && bytes > 0 &&
+                     fill_complement_sequential((uint8_t*) host, offsets, bytes);
+    if (seq) {
+        const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count();
+        for (int64_t done = 8; done < n_layers_; done += 8) {
+            const uint64_t part = bytes * (uint64_t) done / (uint64_t) n_layers_;
+            std::fprintf(stderr, "FileExpertSource: copied cache complement through layer %lld/%lld (%.2f GiB, %.0f s)\n",
+                         (long long) done, (long long) n_layers_, (double) part / 1073741824.0, sec);
+        }
+        std::fprintf(stderr, "FileExpertSource: copied cache complement through layer %lld/%lld (%.2f GiB, %.0f s)\n",
+                     (long long) n_layers_, (long long) n_layers_, (double) bytes / 1073741824.0, sec);
+        std::fflush(stderr);
+    }
     auto worker = [&]() {
         for (;;) {
             const int64_t layer = next_layer.fetch_add(1);
@@ -3635,7 +3823,7 @@ bool FileExpertSource::pin_cache_complement(
                              std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count());
         }
     };
-    {
+    if (!seq) {
         const int threads = (int) std::max<int64_t>(1, std::min<int64_t>(6, n_layers_));
         std::vector<std::thread> pool;
         for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
