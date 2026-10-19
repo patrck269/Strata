@@ -39,6 +39,8 @@
 #define PSAPI_VERSION 2
 #include <windows.h>
 #include <psapi.h>
+#include <io.h>
+#include <share.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -830,6 +832,94 @@ void test_foresight_exchange(bool two_phase) {
     src.close();
 }
 
+// The default complement fill (no opt-in) reads experts.bin unbuffered and stores each blob at its complement
+// offset. Rank puts expert 1 ahead of expert 0, so a linear dump of the file would not byte-match.
+#if defined(_WIN32)
+struct StderrCapture {
+    fs::path path;
+    int saved = -1;
+    FILE* file = nullptr;
+
+    explicit StderrCapture(const fs::path& p) : path(p) {
+        saved = _dup(_fileno(stderr));
+        file = _fsopen(path.string().c_str(), "w", _SH_DENYNO);
+        if (file != nullptr && saved >= 0) _dup2(_fileno(file), _fileno(stderr));
+    }
+    ~StderrCapture() {
+        fflush(stderr);
+        if (saved >= 0) {
+            _dup2(saved, _fileno(stderr));
+            _close(saved);
+        }
+        if (file != nullptr) fclose(file);
+    }
+    std::string text() {
+        fflush(stderr);
+        std::ifstream in(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+};
+
+void test_complement_sequential_fill() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    TempDirectory dir;
+    std::string err;
+    require(expert_layout_load(dir.path.string(), 1, 5, err), err);
+    const size_t bytes = (size_t) BLOB;
+    std::vector<std::vector<uint8_t>> truth(5, std::vector<uint8_t>(bytes));
+    {
+        std::ofstream out(dir.path / "experts.bin", std::ios::binary);
+        for (size_t e = 0; e < truth.size(); ++e) {
+            for (size_t i = 0; i < bytes; ++i) truth[e][i] = (uint8_t) ((i * 131u + e * 37u) ^ (i >> 8));
+            out.write((const char*) truth[e].data(), (std::streamsize) bytes);
+        }
+        require((bool) out, "fixture write failed");
+    }
+    FileExpertSource src;
+    ExpertCache cache;
+    require(src.open(dir.path.string(), 1, 5, err), err);
+    require(!src.unbuffered(), "the fixture opened on the unbuffered tier");
+    require(cache.open(2, 1, 5, (int64_t) BLOB, err), err);
+    for (int e : {2, 3}) {
+        const int slot = cache.admit(0, e);
+        require(slot >= 0 && cache.fill_slot_blocking(slot, truth[e].data(), err), err);
+    }
+    // Hottest first is expert 1, then 0. The file stores 0 then 1. The GPU holds 2 and 3.
+    const std::vector<std::pair<int32_t, int32_t>> rank{{0, 1}, {0, 0}, {0, 2}, {0, 3}, {0, 4}};
+    std::string log;
+    {
+        StderrCapture cap(dir.path / "pin-stderr.txt");
+        require(cap.file != nullptr && cap.saved >= 0, "could not capture the complement log");
+        require(src.pin_cache_complement(cache, err, true, {}, -1, 0, 2 * bytes, &rank), err);
+        log = cap.text();
+    }
+    require(log.find("sequential unbuffered complement fill missed") == std::string::npos, log);
+    const std::string marker = "sequential unbuffered complement fill placed";
+    const size_t at = log.find(marker);
+    require(at != std::string::npos, "the default fill did not run: " + log);
+    require(log.find("page-locked and mapped") != std::string::npos, "the complement was not page-locked and mapped");
+    require(!src.unbuffered(), "the fill changed the file tier");
+    require(src.has_resident(0, 0) && src.has_resident(0, 1), "the budget's experts are not resident");
+    require(!src.has_resident(0, 2) && !src.has_resident(0, 3) && !src.has_resident(0, 4),
+            "a GPU or file expert was copied into the complement");
+    const uint8_t* b0 = src.blob(0, 0);
+    const uint8_t* b1 = src.blob(0, 1);
+    require(b0 != nullptr && b1 != nullptr, "a resident blob pointer is null");
+    require(b0 == b1 + bytes, "expert 0 is not stored after expert 1 at the complement offset");
+    require(std::memcmp(b1, truth[1].data(), bytes) == 0, "expert 1 does not byte-match the fixture");
+    require(std::memcmp(b0, truth[0].data(), bytes) == 0, "expert 0 does not byte-match the fixture");
+    std::vector<uint8_t> actual(bytes);
+    require(src.copy_blob(0, 0, actual.data()) && actual == truth[0], "copy_blob of expert 0 does not byte-match");
+    require(src.copy_blob(0, 1, actual.data()) && actual == truth[1], "copy_blob of expert 1 does not byte-match");
+    require(src.copy_blob(0, 4, actual.data()) && actual == truth[4], "the file expert changed");
+    const size_t end = log.find('\n', at);
+    std::cout << log.substr(at, end == std::string::npos ? std::string::npos : end - at) << '\n';
+    std::cout << "sequential unbuffered complement fill: resident blobs byte-match PASS\n";
+    src.close();
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -847,6 +937,9 @@ int main(int argc, char** argv) {
         test_io_prefetch();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
+#endif
+#if defined(_WIN32)
+        test_complement_sequential_fill();
 #endif
         if (argc == 2 && std::string(argv[1]) == "--rotation-gpu") {
             test_rotating_source(false, true);
