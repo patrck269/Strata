@@ -3319,6 +3319,44 @@ __global__ void __launch_bounds__(256) s26_gu_l_kernel(const unsigned long long*
 
 constexpr int S26_HMAX = 640 / 32;    // q8_1 blocks of one SwiGLU row (n_ff 640)
 
+// The two folds below were template lambdas (C++20). nvcc ignores -std=c++20 on some host
+// compilers, so they are device functions. The arithmetic is the same.
+template<bool SL, int RPW, int NI, int GRP, int G0, int... J>
+__device__ __forceinline__ void s26_bal_group(std::integer_sequence<int, J...>, int lane, int n,
+                                              const uint8_t* const* wr, const block_q8_1* hbase, const int* off,
+                                              float (*s)[GRP]) {
+    Split<20>::W w[sizeof...(J)];
+    int kk[sizeof...(J)];
+    bool hh[sizeof...(J)];
+    ([&] {
+        using B = S26Bal<G0 + J, NI, RPW>;
+        hh[J] = B::QB != B::QA && lane >= B::THR;
+        kk[J] = B::P0 + lane - (hh[J] ? B::QB : B::QA) * NI;
+        const uint8_t* rp = hh[J] ? wr[B::QB] : wr[B::QA];
+        if constexpr (SL) w[J] = S26Split<20, false>::load(rp, kk[J] / 2, 2 * (kk[J] % 2));
+        else w[J] = Split<20>::load(rp, kk[J] / 2, 2 * (kk[J] % 2));
+    }(), ...);
+    ([&] {
+        using B = S26Bal<G0 + J, NI, RPW>;
+#pragma unroll
+        for (int c = 0; c < GRP; ++c)
+            if (c < n) {
+                const float v = Split<20>::apply(w[J], hbase + off[c] + kk[J] / 2, 2 * (kk[J] % 2));
+                if (hh[J]) s[B::QB][c] += v; else s[B::QA][c] += v;
+            }
+    }(), ...);
+}
+
+template<bool SL, int RPW, int NI, int GRP, int G, int... Q>
+__device__ __forceinline__ void s26_bal_groups(std::integer_sequence<int, Q...>, int lane, int n,
+                                               const uint8_t* const* wr, const block_q8_1* hbase, const int* off,
+                                               float (*s)[GRP]) {
+    constexpr int IT = RPW * NI / 32;
+    (s26_bal_group<SL, RPW, NI, GRP, Q * G>(
+         std::make_integer_sequence<int, (IT - Q * G < G ? IT - Q * G : G)>{},
+         lane, n, wr, hbase, off, s), ...);
+}
+
 template<bool LX, int RPW, bool SL = false, bool TS = false, int BAL = 0>
 __global__ void __launch_bounds__(256) s26_down_l_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                          const int32_t* __restrict__ grp_start,
@@ -3365,32 +3403,9 @@ __global__ void __launch_bounds__(256) s26_down_l_kernel(const unsigned long lon
         if constexpr (BAL > 0) {   // S26: 5 items per lane instead of 8 / 4, in BAL groups (loads first)
             constexpr int NI = 2 * S26_HMAX, IT = RPW * NI / 32;
             static_assert(RPW * NI % 32 == 0, "whole steps");
-            auto group = [&]<int G0, int... J>(std::integer_sequence<int, J...>) {
-                Split<20>::W w[sizeof...(J)];
-                int kk[sizeof...(J)];
-                bool hh[sizeof...(J)];
-                ([&] {
-                    using B = S26Bal<G0 + J, NI, RPW>;
-                    hh[J] = B::QB != B::QA && lane >= B::THR;
-                    kk[J] = B::P0 + lane - (hh[J] ? B::QB : B::QA) * NI;
-                    const uint8_t* rp = hh[J] ? wr[B::QB] : wr[B::QA];
-                    if constexpr (SL) w[J] = S26Split<20, false>::load(rp, kk[J] / 2, 2 * (kk[J] % 2));
-                    else w[J] = Split<20>::load(rp, kk[J] / 2, 2 * (kk[J] % 2));
-                }(), ...);
-                ([&] {
-                    using B = S26Bal<G0 + J, NI, RPW>;
-#pragma unroll
-                    for (int c = 0; c < GRP_NC; ++c)
-                        if (c < n) {
-                            const float v = Split<20>::apply(w[J], hbase + off[c] + kk[J] / 2, 2 * (kk[J] % 2));
-                            if (hh[J]) s[B::QB][c] += v; else s[B::QA][c] += v;
-                        }
-                }(), ...);
-            };
             constexpr int G = (IT + BAL - 1) / BAL;
-            [&]<int... Q>(std::integer_sequence<int, Q...>) {
-                (group.template operator()<Q * G>(std::make_integer_sequence<int, (IT - Q * G < G ? IT - Q * G : G)>{}), ...);
-            }(std::make_integer_sequence<int, BAL>{});
+            s26_bal_groups<SL, RPW, NI, GRP_NC, G>(std::make_integer_sequence<int, BAL>{},
+                                                   lane, n, wr, hbase, off, s);
         } else
         for (int k = lane; k < nb * 2; k += 32) {
             const int kbx = k / 2, iqs = 2 * (k % 2);
