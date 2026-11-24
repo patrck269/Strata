@@ -29,6 +29,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -1370,6 +1371,9 @@ public:
             }
         }
         ram_experts_loaded_ = ram_plan.size();
+        std::fprintf(stderr, "EXPERT_PLACEMENT gpu=%zu ram=%zu total=%zu gpu_bytes=%zu ssd=%zu\n",
+                     vram_experts_loaded_, ram_experts_loaded_, n_dir, arena_bytes + peer_arena_bytes,
+                     n_dir - vram_experts_loaded_ - ram_experts_loaded_);
         if (model.kind == ModelSourceKind::Strata && vram_experts_loaded_ + ram_experts_loaded_ < n_dir && max_exp_bytes > 0) {
             std::vector<InkColdExpertDesc> cdescs(n_dir);
             const uint64_t sec4_off = model.rd.header().sections[4].file_offset;
@@ -2632,10 +2636,17 @@ public:
         return n_acc;
     }
 
+    double last_vision_load_ms() const noexcept override { return vision_load_ms_; }
+
     bool encode_image(const ImageRec& img, std::vector<float>& out_embeds, std::string& err) override {
+        vision_load_ms_ = 0.0;
         if (opts_.vision_path.empty()) return false;
         if (!vision_.loaded) {
-            if (!load_vision_gpu(opts_.vision_path, err)) return false;
+            const auto start = std::chrono::steady_clock::now();
+            const bool loaded = load_vision_gpu(opts_.vision_path, err);
+            vision_load_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            std::fprintf(stderr, "VISION_LOAD device=hip ms=%.3f success=%d\n", vision_load_ms_, loaded ? 1 : 0);
+            if (!loaded) return false;
         }
         const VitCfg& vc = vision_.info.c;
         const int merge = vc.merge;
@@ -5796,6 +5807,7 @@ private:
 
     const InkModelFile* model_ = nullptr;
     BackendOpts opts_;
+    double vision_load_ms_ = 0.0;
     InkCfg c_;
     DsparkCfg dspark_cfg_;
     DeviceMemoryInfo mem_info_;

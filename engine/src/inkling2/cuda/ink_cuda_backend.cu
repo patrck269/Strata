@@ -11,6 +11,7 @@
 #include "ink_runner.cuh"
 #include "ink_spec.cuh"
 #include "ink_topk.cuh"
+#include "ink_cuda_vision.cuh"
 #include "strata/core/arch_probe.hpp"
 #include "strata/core/ink_chunk.hpp"
 #include "strata/core/volta_forever.hpp"
@@ -124,6 +125,7 @@ public:
         spec_cfg_.beam = std::max(1, std::min(8, spec_cfg_.beam));
         spec_cfg_.log = std::getenv("STRATA_INK_SPEC_LOG") != nullptr;
         cleanup();
+        vision_path_ = opts.vision_path;
         int n_dev = 0;
         cudaError_t ce = cudaGetDeviceCount(&n_dev);
         if (ce != cudaSuccess || n_dev <= 0) {
@@ -1138,6 +1140,22 @@ public:
         return n_emit;
     }
 
+    double last_vision_load_ms() const noexcept override { return vision_load_ms_; }
+
+    bool encode_image(const ImageRec& img, std::vector<float>& out, std::string& err) override {
+        vision_load_ms_ = 0.0;
+        if (vision_path_.empty()) { err = "CUDA vision shard not configured"; return false; }
+        if (!vision_.loaded()) {
+            const auto start = std::chrono::steady_clock::now();
+            const bool loaded = vision_.load(vision_path_, gpu_id_, err);
+            vision_load_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            std::fprintf(stderr, "VISION_LOAD device=cuda ms=%.3f bytes=%zu success=%d\n",
+                         vision_load_ms_, vision_.device_bytes(), loaded ? 1 : 0);
+            if (!loaded) return false;
+        }
+        return vision_.encode(img, out, err);
+    }
+
     bool selfcheck(std::string& err) override {
         cudaDeviceProp prop{};
         cudaError_t ce = cudaGetDeviceProperties(&prop, gpu_id_);
@@ -1172,6 +1190,9 @@ private:
     }
 
     void cleanup() {
+        vision_.clear();
+        vision_path_.clear();
+        vision_load_ms_ = 0.0;
         if (dspark_) { dspark_->free_all(); dspark_.reset(); }
         if (runner_) { runner_->free_all(); runner_.reset(); }
         if (d_sconv_snap_) { cudaFree(d_sconv_snap_); d_sconv_snap_ = nullptr; }
@@ -1209,6 +1230,9 @@ private:
     int dspark_slot_ = -1;
     KvDtype kv_dtype_ = KvDtype::FP16;
     std::string dev_info_;
+    CudaVisionEncoder vision_;
+    std::string vision_path_;
+    double vision_load_ms_ = 0.0;
 
     strata::ink::InkCudaModel model_;
     std::unique_ptr<strata::ink::InkCudaRunner> runner_;

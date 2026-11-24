@@ -40,6 +40,7 @@ struct BackendOpts {
     bool spec_adapt = false;     // --draft-adapt: per request, drafting goes off for 40 steps when its measured gain falls below 0.93 (all backends, see ink_serve.h)
     std::string dspark_path;     // optional external mtp.safetensors or dspark-*.gguf
     std::string vision_path;
+    std::string vision_device = "auto"; // auto: GPU then CPU; gpu: require device encoding; cpu: never call GPU hook
 };
 
 struct BackendStats {
@@ -169,6 +170,9 @@ public:
         (void)img; (void)out_embeds; (void)err;
         return false;
     }
+    // Synchronous lazy weight-load time for the most recent image hook, separate from encode latency.
+    virtual double last_vision_load_ms() const noexcept { return 0.0; }
+
 
     // Verify Section 5 selfcheck / golden ops parity on this backend
     virtual bool selfcheck(std::string& err) = 0;

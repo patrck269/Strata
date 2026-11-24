@@ -1124,6 +1124,9 @@ private:
     /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped on
     /// Windows, io_submit on Linux) into this thread's aligned buffer, then copied into place.  False when a read fails.
     bool read_direct(const Fill* fills, size_t n) const;
+    /// Startup complement: file-ordered unbuffered reads into the existing ranked offsets.
+    /// Owns temporary handles; false leaves the caller to recopy every blob through its mapped copier.
+    bool fill_complement_sequential(uint8_t* host, const std::vector<uint64_t>& offsets, uint64_t bytes);
     bool open_direct(std::string& why);
     /// Windows: experts.bin mapped again as `open` maps it (begin/end_startup_unbuffered).
     bool map_view(std::string& why);

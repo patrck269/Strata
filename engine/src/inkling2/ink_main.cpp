@@ -872,6 +872,12 @@ int main(int argc, char** argv) {
         } else if (a == "--vision") {
             cfg.vision_path = next();
             cfg.bopts.vision_path = cfg.vision_path;
+        } else if (a == "--vision-device") {
+            cfg.bopts.vision_device = next();
+            if (cfg.bopts.vision_device != "auto" && cfg.bopts.vision_device != "gpu" && cfg.bopts.vision_device != "cpu") {
+                fprintf(stderr, "unknown --vision-device value '%s' (expected: auto, gpu, cpu)\n", cfg.bopts.vision_device.c_str());
+                return 2;
+            }
         } else if (a == "--max-context" || a == "--ctx") {
             cfg.bopts.max_ctx = std::atoi(next().c_str());
         } else if (a == "--parallel" || a == "--batch" || a == "--slots") {
@@ -976,6 +982,7 @@ int main(int argc, char** argv) {
                    "  --version\n"
                    "  --info PATH [--vision VISION] [--dspark PATH]\n"
                    "  --export-tokenizer PATH OUT_DIR\n"
+                   "  --vision-device auto|gpu|cpu (default auto; gpu never falls back to CPU)\n"
                    "  --selfcheck [--native PATH] [--verify-hash] [--cpu] [--gpu N] [--gpus 1|2] [--kv auto|fp16|fp8|k8v8|k8v4]\n"
                    "  --bench --native PATH [--parallel 1..64] [--gpu N] [--gpus 1..4] [--layer-split auto|K1,K2,...] [--ep-split F] [--vram-experts-gb F] [--ram-experts-gb F] [--ssd-experts] [--vram-reserve-mib N] [--cpu-threads N] [--kv auto|fp16|fp8|k8v8|k8v4] [--kv-offload auto|on|off] [--prompt-len N] [--gen N]\n"
                    "  --kld-eval REF.bin --native PATH\n"

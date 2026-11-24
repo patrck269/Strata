@@ -1004,6 +1004,30 @@ if((STRATA_BUILD_INKLING AND STRATA_BUILD_INKLING2) AND EXISTS "${CMAKE_CURRENT_
   add_subdirectory(src/inkling2)
 endif()
 
+if(STRATA_BUILD_TESTS)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  set(STRATA_INK_VISION_TEST_MODEL "" CACHE FILEPATH "External native Inkling model pack for device dispatch")
+  set(STRATA_INK_VISION_TEST_SHARD "" CACHE FILEPATH "External native Inkling vision shard")
+  add_test(NAME ink_vision_device_test COMMAND ${Python3_EXECUTABLE}
+           ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/ink_vision_device_test.py $<TARGET_FILE:strata-inkling>
+           ${STRATA_INK_VISION_TEST_MODEL} ${STRATA_INK_VISION_TEST_SHARD})
+  set_tests_properties(ink_vision_device_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "vision")
+endif()
+
+if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS)
+  add_executable(ink_vision_cuda_test tests/cuda/ink_vision_cuda_test.cu)
+  target_link_libraries(ink_vision_cuda_test PRIVATE strata_inkling_core CUDA::cudart CUDA::cublas)
+  set_target_properties(ink_vision_cuda_test PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON
+                        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}" CUDA_RUNTIME_LIBRARY Shared)
+  target_compile_options(ink_vision_cuda_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+  if(WIN32)
+    target_compile_definitions(ink_vision_cuda_test PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+  endif()
+  set(STRATA_INK_VISION_TEST_SHARD "" CACHE FILEPATH "External native Inkling vision shard for CUDA parity")
+  add_test(NAME ink_vision_cuda_test COMMAND ink_vision_cuda_test ${STRATA_INK_VISION_TEST_SHARD})
+  set_tests_properties(ink_vision_cuda_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda;vision")
+endif()
+
 # What this configure registered, so a missing capability is a stated skip (tools/check prints this line too).
 if(STRATA_BUILD_TESTS)
   set(_strata_test_kinds "cpu")

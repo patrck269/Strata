@@ -267,6 +267,8 @@ public:
             loaded_bytes += dir[idx].body_bytes;
             ++n_loaded;
         }
+        std::fprintf(stderr, "EXPERT_PLACEMENT gpu=0 ram=%zu total=%zu gpu_bytes=0 ssd=%zu\n",
+                     n_loaded, dir.size(), dir.size() - n_loaded);
         if (n_loaded < dir.size() && max_exp_bytes > 0) {
             std::vector<InkColdExpertDesc> cdescs(dir.size());
             const uint64_t sec4_off = model.rd.header().sections[4].file_offset;
