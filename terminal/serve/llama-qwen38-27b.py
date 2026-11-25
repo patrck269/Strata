@@ -12,6 +12,9 @@ SERVER = r"M:\Strata\llama-cpp\llama-server.exe"
 MODEL = r"M:\Strata-data\models\qwen3.8-27b\Huihui-Qwen3.8-27B-abliterated-Q4_K.gguf"
 # Vision projector stays on the CPU so the GPU keeps its room for weights and the two KV slots.
 MMPROJ = r"M:\Strata-data\models\qwen3.8-27b\mmproj-model-bf16.gguf"
+# The GGUF's own template plus effort aliases (high/max -> xhigh, minimal -> no thinking); the embedded one
+# raises a 500 on those words, which OpenAI-style clients such as Rakazo send.
+CHAT_TEMPLATE = r"M:\Strata-data\models\qwen3.8-27b\chat_template.jinja"
 
 
 class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
@@ -87,6 +90,7 @@ def main():
         "--spec-type", "draft-mtp",
         "--spec-draft-n-max", "2",
         "--jinja",
+        "--chat-template-file", CHAT_TEMPLATE,
         "--host", "127.0.0.1",
         "--port", sys.argv[1],
     ]
