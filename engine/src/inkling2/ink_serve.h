@@ -641,14 +641,37 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 rq.active = false;
                 return false;
             }
-            // Encode images (try GPU backend first, fallback to CPU ViT)
+            // Forced GPU failures are request errors; CPU mode never initializes GPU vision weights.
             for (size_t k = 0; k < recs.size(); ++k) {
                 std::vector<float> emb;
                 std::string verr;
-                if (!backend.encode_image(recs[k], emb, verr)) {
-                    if (!cpu_vit.loaded && !cpu_vit.load(cfg.vision_path, err)) { rq.active = false; return false; }
+                const double start = now_s();
+                double load_ms = 0.0;
+                bool gpu_encoded = false;
+                if (cfg.bopts.vision_device != "cpu") {
+                    gpu_encoded = backend.encode_image(recs[k], emb, verr);
+                    load_ms = backend.last_vision_load_ms();
+                    if (!gpu_encoded && cfg.bopts.vision_device == "gpu") {
+                        err = "image: forced GPU vision failed: " + (verr.empty() ? std::string("unsupported backend encoder") : verr);
+                        rq.active = false;
+                        return false;
+                    }
+                }
+                if (!gpu_encoded) {
+                    if (!cpu_vit.loaded) {
+                        const double load_start = now_s();
+                        const bool loaded = cpu_vit.load(cfg.vision_path, err);
+                        const double cpu_load_ms = (now_s() - load_start) * 1000.0;
+                        load_ms += cpu_load_ms;
+                        fprintf(stderr, "VISION_LOAD device=cpu ms=%.3f success=%d\n", cpu_load_ms, loaded ? 1 : 0);
+                        if (!loaded) { rq.active = false; return false; }
+                    }
                     if (!cpu_vit.encode(recs[k], emb, err)) { rq.active = false; return false; }
                 }
+                const char* device = gpu_encoded ? backend.backend_name() : "cpu";
+                fprintf(stderr, "VISION_ENCODE device=%s slot=%d image=%zu tokens=%d ms=%.3f\n",
+                        device, rq.slot, k, recs[k].num_lm_tokens(), std::max(0.0, (now_s() - start) * 1000.0 - load_ms));
+                fflush(stderr);
                 rq.img_embeds.insert(rq.img_embeds.end(), emb.begin(), emb.end());
                 proto("IMG %zu %d %d %d", k, recs[k].grid_h, recs[k].grid_w, recs[k].num_lm_tokens());
             }

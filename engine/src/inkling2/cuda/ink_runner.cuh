@@ -247,6 +247,7 @@ struct InkCudaModel {
     uint8_t* h_sec4_pinned = nullptr;  // optional pinned overflow for 8/12/16 GB GPUs
     size_t trunk_bytes = 0, sec4_bytes = 0, sec4_peer_bytes = 0;
     size_t n_vram_experts = 0, n_peer_experts = 0, n_host_experts = 0;
+    size_t n_ssd_experts_loaded = 0, vram_expert_bytes = 0;   // benchmark/telemetry placement ledger
 
     // Preprocessed per-layer F32 buffers (tiny: < 40 MB total)
     float* d_msg_queries[12] = {};      // [4, 2304] F32 for physical layers 6..17
@@ -421,6 +422,8 @@ struct InkCudaModel {
             INK_CK(cudaFreeHost(hbuf));
             n_vram_experts = n_total;
             n_host_experts = 0;
+            n_ssd_experts_loaded = 0;
+            vram_expert_bytes = sec4_bytes;
         } else {
             // 3x Loop-Weighted Tiered Residency + Strata Predictive CPU/RAM Hybrid Engine (Doorbell + Ping-Pong DMA) + Auto-SSD!
             const auto& vorder = rd.vram_load_order();
@@ -522,6 +525,8 @@ struct InkCudaModel {
                 }
             }
             INK_CK(cudaMalloc(&d_sec4, std::max<size_t>(256, vram_used)));
+            n_ssd_experts_loaded = n_ssd_experts;
+            vram_expert_bytes = vram_used;
             uint8_t* h_arena_base = nullptr;
             if (n_host_experts > 0) {
                 if (host_used > 0) {
@@ -714,6 +719,9 @@ struct InkCudaModel {
                      strata_path.c_str(), man.build.c_str(), (double)trunk_bytes / 1e9, t_trunk,
                      n_vram_experts, n_host_experts, t_exp, (int)hybrid.active, hybrid.n_promo_slots,
                      (double)hybrid.pf_stage_bytes / (1024.0 * 1024.0), (int)sm120::available(), (int)unembed_screen.ready);
+        std::fprintf(stderr, "EXPERT_PLACEMENT gpu=%zu ram=%zu total=%zu gpu_bytes=%zu ssd=%zu\n",
+                     n_vram_experts, n_host_experts - n_ssd_experts_loaded, n_vram_experts + n_host_experts,
+                     vram_expert_bytes, n_ssd_experts_loaded);
         return true;
     }
 

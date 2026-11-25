@@ -4823,18 +4823,15 @@ bool FileExpertSource::pin_cache_complement(
         if (fail_msg.empty()) fail_msg = m;
         failed.store(true);
     };
-    const bool seq = host != nullptr && bytes > 0 &&
-                     fill_complement_sequential((uint8_t*) host, offsets, bytes);
-    if (seq) {
-        const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count();
-        for (int64_t done = 8; done < n_layers_; done += 8) {
-            const uint64_t part = bytes * (uint64_t) done / (uint64_t) n_layers_;
-            std::fprintf(stderr, "FileExpertSource: copied cache complement through layer %lld/%lld (%.2f GiB, %.0f s)\n",
-                         (long long) done, (long long) n_layers_, (double) part / 1073741824.0, sec);
-        }
+    const bool sequential = host != nullptr && bytes > 0 &&
+                            fill_complement_sequential((uint8_t*) host, offsets, bytes);
+    if (sequential) {
+        copied.store(bytes);
+        layers_done.store(n_layers_);
+        next_layer.store(n_layers_);
         std::fprintf(stderr, "FileExpertSource: copied cache complement through layer %lld/%lld (%.2f GiB, %.0f s)\n",
-                     (long long) n_layers_, (long long) n_layers_, (double) bytes / 1073741824.0, sec);
-        std::fflush(stderr);
+                     (long long) n_layers_, (long long) n_layers_, (double) bytes / 1073741824.0,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count());
     }
     auto worker = [&]() {
         for (;;) {
@@ -4923,7 +4920,7 @@ bool FileExpertSource::pin_cache_complement(
                              std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count());
         }
     };
-    if (!seq) {
+    if (!sequential) {
         const int threads = (int) std::max<int64_t>(1, std::min<int64_t>(6, n_layers_));
         std::vector<std::thread> pool;
         for (int i = 1; i < threads; ++i) pool.emplace_back(worker);

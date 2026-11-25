@@ -7,6 +7,38 @@ from serve.frontend import ChatTemplate, anthropic_to_messages, openai_to_messag
 from serve.server import ByteTokenizer, MockEngine, Service
 
 
+class CurrentFactsSearchGuidance(unittest.TestCase):
+    def setUp(self):
+        self.template = ChatTemplate(Path(__file__).with_name("chat_template.jinja"))
+        self.messages = [{"role": "developer", "content": "Be concise."},
+                         {"role": "user", "content": "What is the latest release?"}]
+
+    def test_search_guidance_requires_the_search_tool(self):
+        guidance = "Call web_search before answering news, current events"
+        search = {"name": "web_search", "parameters": {"type": "object"}}
+        rendered = self.template.render(self.messages, tools=[search])
+        self.assertIn(guidance, rendered)
+        self.assertIn("A greeting, an opinion", rendered)
+        self.assertIn("Be concise.", rendered)
+        for tools in (None, [], [{"name": "calculate", "parameters": {"type": "object"}}]):
+            with self.subTest(tools=tools):
+                self.assertNotIn(guidance, self.template.render(self.messages, tools=tools))
+
+    def test_structured_tool_roundtrip_keeps_arguments_and_result(self):
+        history = self.messages + [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"type": "function", "function": {"name": "web_search",
+                 "arguments": {"query": "latest Strata", "limit": 2}}}]},
+            {"role": "tool", "content": "Release v0.2.21 confirmed."},
+            {"role": "user", "content": "Use that result."},
+        ]
+        prompt = self.template.render(history, tools=[{"name": "web_search"}])
+        self.assertIn("<function=web_search>", prompt)
+        self.assertIn("latest Strata", prompt)
+        self.assertIn("Release v0.2.21 confirmed.", prompt)
+        self.assertIn("Use that result.", prompt)
+
+
 class EmptyAssistantHistory(unittest.TestCase):
     def setUp(self):
         self.template = ChatTemplate(Path(__file__).with_name("chat_template.jinja"))
